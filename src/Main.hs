@@ -1,14 +1,20 @@
-{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE FlexibleInstances, ScopedTypeVariables #-}
 
+import System.Environment (getArgs)
+import System.Console.GetOpt
 import Language.C
+import Data.Generics
 
 main :: IO ()
-main = putStrLn "Hello, world!"
+main = do
+  args <- getArgs
+  let (flags, nonOpts, msgs) = getOpt RequireOrder options args
+  putStrLn $ show nonOpts
 
-parseFromString :: String -> CTranslUnit
-parseFromString s = case (parseC (inputStreamFromString s) (nopos)) of
-  Left err -> error $ show err
-  Right tu -> tu
+options =
+  [
+--    Option ['r'] ["numUnroll"] (OptArg )
+  ]
 
 -- Loopy programs:
 loop1 = parseFromString $
@@ -29,45 +35,50 @@ loop2 = parseFromString $
         "  return x;" ++
         "}"
 
-unrollForLoop :: Int -> CStat -> CStat
-unrollForLoop n (CFor init until update stmt node) = undefined
-unrollForLoop _ _ = error "Non-for-loop given to unrollForLoop."
+unrollLoops :: Int -> CTranslUnit -> CTranslUnit
+unrollLoops n = everywhere' (mkT unrollLoops')
+  where 
+    unrollLoops' :: CStat -> CStat
+    unrollLoops' (CWhile expr stmt isDoWhile _)
+      | not isDoWhile =
+        let ni = undefNode
+            blocks = take n (fmap (\s -> CBlockStmt (CIf expr s Nothing ni)) $ repeat stmt)
+        in CCompound [] blocks ni
+      | otherwise = error "TODO: \"do {} while\" case"
+    unrollLoops' (CFor init until update stmt node) = undefined
+    unrollLoops' s = s
 
--- TODO: "do while" case
-unrollWhileLoop :: Int -> CStat -> CStat
-unrollWhileLoop n (CWhile expr stmt isDoWhile _)
-  | not isDoWhile =
-    let ni = undefNode
-        unrolledStmts = unrollLoops n stmt
-        blocks = take n (fmap (\s -> CBlockStmt (CIf expr s Nothing ni)) $ repeat unrolledStmts)
-    in CCompound [] blocks ni
-  | otherwise = error "TODO: \"do while\" case"
-unrollWhileLoop _ _ = error "Non-for-loop given to unrollForLoop."
 
-class Unrollable a where
-  unrollLoops :: Int -> a -> a
+removeAssnOps :: CTranslUnit -> CTranslUnit
+removeAssnOps = everywhere' (mkT removeAssnOps')
+  where
+    removeAssnOps' :: CExpr -> CExpr
+    removeAssnOps' (CAssign op exprL exprR node) =
+      (CAssign CAssignOp exprL exprR' node)
+      where
+        exprR' =
+          case op of
+            CAssignOp -> exprR -- Keep regular assignments as they are.
+            CMulAssOp -> CBinary CMulOp exprL exprR undefNode
+            CDivAssOp -> CBinary CDivOp exprL exprR undefNode
+            CRmdAssOp -> CBinary CRmdOp exprL exprR undefNode
+            CAddAssOp -> CBinary CAddOp exprL exprR undefNode
+            CSubAssOp -> CBinary CSubOp exprL exprR undefNode
+            CShlAssOp -> CBinary CShlOp exprL exprR undefNode
+            CShrAssOp -> CBinary CShrOp exprL exprR undefNode
+            CAndAssOp -> CBinary CAndOp exprL exprR undefNode
+            CXorAssOp -> CBinary CXorOp exprL exprR undefNode
+            COrAssOp -> CBinary COrOp exprL exprR undefNode
+    removeAssnOps' e = e
 
-instance Unrollable CTranslUnit where
-  unrollLoops n (CTranslUnit exdecls node) = CTranslUnit (fmap (unrollLoops n) exdecls) node
+parseFromString :: String -> CTranslUnit
+parseFromString s =
+  case (parseC (inputStreamFromString s) (nopos)) of
+    Left err -> error $ show err
+    Right tu -> tu
 
-instance Unrollable CExtDecl where
-  unrollLoops n (CFDefExt (CFunDef dss declr decls stmt node)) =
-    (CFDefExt (CFunDef dss declr decls (unrollLoops n stmt) node))
-  unrollLoops n decl = decl
-
-instance Unrollable CStat where
-  unrollLoops n (CCompound ids blocks node) = CCompound ids (fmap (unrollLoops n) blocks) node
-  unrollLoops n (CWhile expr stmt isDoWhile node) = unrollWhileLoop n (CWhile expr stmt isDoWhile node)
-  unrollLoops n (CFor init until update stmt node) = unrollForLoop n (CFor init until update stmt node)
-  unrollLoops n (CSwitch expr stmt node) = CSwitch expr (unrollLoops n stmt) node
-  unrollLoops n (CCase expr stmt node) = CCase expr (unrollLoops n stmt) node
-  unrollLoops n (CCases expr expr2 stmt node) = CCases expr expr2 (unrollLoops n stmt) node
-  unrollLoops n (CDefault stmt node) = CDefault (unrollLoops n stmt) node
-  unrollLoops n (CIf expr thenStmt elseStmt node) = CIf expr (unrollLoops n thenStmt) (fmap (unrollLoops n) elseStmt) node
-  -- TODO: do we need one for label?
-  unrollLoops _ stat = stat
-
-instance Unrollable CBlockItem where
-  unrollLoops n (CBlockStmt stmt) = CBlockStmt (unrollLoops n stmt)
-  unrollLoops _ (CBlockDecl decl) = CBlockDecl decl
-  unrollLoops _ (CNestedFunDef _) = error "Nested function definitions are not supported!"
+parseStmtFromString :: String -> CStat
+parseStmtFromString s =
+  case (execParser statementP (inputStreamFromString s) (nopos) [] newNameSupply) of
+    Left err -> error $ show err
+    Right (tu, _) -> tu

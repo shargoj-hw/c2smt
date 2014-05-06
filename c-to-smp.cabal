@@ -19,4 +19,4 @@ executable c-to-smp
 
   main-is: Main.hs
 
-  build-depends: base, language-c ==0.4.5
+  build-depends: base, language-c ==0.4.5, syb
