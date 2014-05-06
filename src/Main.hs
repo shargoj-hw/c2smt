@@ -35,6 +35,22 @@ loop2 = parseFromString $
         "  return x;" ++
         "}"
 
+multiDecl = parseFromString $
+            "int main () {" ++
+            "  float x;" ++
+            "  x = 3 * 9;" ++
+            "  float y;" ++
+            "  y += x + 3;" ++
+            "  return 0;" ++
+            "}";
+
+complicatedDecl = parseFromString $
+                  "int main () {" ++
+                  "  float a, b=2.0, *c, *d = 4;" ++
+                  "  static float n = 3, m;" ++
+                  "  return 0;" ++
+                  "}";
+            
 unrollLoops :: Int -> CTranslUnit -> CTranslUnit
 unrollLoops n = everywhere' (mkT unrollLoops')
   where 
@@ -47,7 +63,6 @@ unrollLoops n = everywhere' (mkT unrollLoops')
       | otherwise = error "TODO: \"do {} while\" case"
     unrollLoops' (CFor init until update stmt node) = undefined
     unrollLoops' s = s
-
 
 removeAssnOps :: CTranslUnit -> CTranslUnit
 removeAssnOps = everywhere' (mkT removeAssnOps')
@@ -70,6 +85,36 @@ removeAssnOps = everywhere' (mkT removeAssnOps')
             CXorAssOp -> CBinary CXorOp exprL exprR undefNode
             COrAssOp -> CBinary COrOp exprL exprR undefNode
     removeAssnOps' e = e
+
+-- TODO: Make sure relative order is maintained. Idea: use CCompound instead of lists
+moveDeclsToTop :: CTranslUnit -> CTranslUnit
+moveDeclsToTop = everywhere (mkT moveDeclsToTop')
+  where
+    moveDeclsToTop' :: [CBlockItem]  -> [CBlockItem]
+    moveDeclsToTop' = moveDeclsToTop'' [] []
+    moveDeclsToTop'' ds nds (d@(CBlockDecl _):bs) = moveDeclsToTop'' (d:ds) nds bs
+    moveDeclsToTop'' ds nds (nd:bs) = moveDeclsToTop'' ds (nd:nds) bs
+    moveDeclsToTop'' ds nds [] = ds ++ nds
+
+splitDeclsAndAssn :: CTranslUnit -> CTranslUnit
+splitDeclsAndAssn = everywhere (mkT splitDeclsAndAssn')
+  where
+    splitDeclsAndAssn' :: [CBlockItem] -> [CBlockItem]
+    splitDeclsAndAssn' = concatMap splitDecl
+    splitDecl bd@(CBlockDecl (CDecl declspecs decls a)) = concatMap splitup decls
+      where
+        splitup (declr@(Just declr'), i@(Just (CInitExpr initialier _)), expr) =
+          [CBlockDecl (CDecl declspecs [(declr, Nothing, expr)] undefNode),
+           CBlockStmt (CExpr
+                       (Just (CAssign CAssignOp (d2e declr') initialier undefNode))
+                       undefNode)]
+        -- initialization lists not supported (yet?):
+        splitup (declr@(Just declr'), i@(Just _), expr) =
+          error "Initialization lists not supported"
+        splitup di = [CBlockDecl (CDecl declspecs [di] undefNode)]
+    splitDecl bi = [bi]
+    d2e (CDeclr (Just i) _ _ _ _) = CVar i undefNode
+
 
 parseFromString :: String -> CTranslUnit
 parseFromString s =
