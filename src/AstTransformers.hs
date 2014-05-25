@@ -1,21 +1,30 @@
+{-# LANGUAGE ScopedTypeVariables #-}
+
 module AstTransformers where
 
-import Language.C
-import Data.Generics
+import           Data.Generics
+import           Language.C
 
 -- For playing in the REPL
-import CExamples
+import           CExamples
 
+-- TODO: How the heck do I do break/continue?
 unrollLoops :: Int -> CTranslUnit -> CTranslUnit
 unrollLoops n = everywhere' (mkT unrollLoops')
-  where 
+  where
+    ni = undefNode
+    unrollWhile :: CExpr -> CStat -> Int -> CStat
+    unrollWhile expr stmt 0 = CIf expr stmt Nothing ni
+    unrollWhile expr stmt n = CIf expr rest Nothing ni
+      where
+        rest =
+          case stmt of
+            CCompound is stmts _ -> CCompound is (stmts ++ [CBlockStmt $ unrollWhile expr stmt (n - 1)]) ni
+            s -> CCompound [] [CBlockStmt s, CBlockStmt $ unrollWhile expr stmt (n - 1)] ni
     unrollLoops' :: CStat -> CStat
     unrollLoops' (CWhile expr stmt isDoWhile _)
-      | not isDoWhile =
-        let ni = undefNode
-            blocks = take n (fmap (\s -> CBlockStmt (CIf expr s Nothing ni)) $ repeat stmt)
-        in CCompound [] blocks ni
-      | otherwise = error "TODO: \"do {} while\" case"
+      | not isDoWhile = unrollWhile expr stmt (n - 1)
+      | otherwise = CCompound [] [CBlockStmt stmt, CBlockStmt $ unrollWhile expr stmt (n - 1)]  ni
     unrollLoops' (CFor init until update stmt node) = undefined init until update stmt node
     unrollLoops' s = s
 
@@ -41,15 +50,20 @@ removeAssnOps = everywhere' (mkT removeAssnOps')
             COrAssOp -> CBinary COrOp exprL exprR undefNode
     removeAssnOps' e = e
 
--- TODO: Make sure relative order is maintained. Idea: use CCompound instead of lists
 moveDeclsToTop :: CTranslUnit -> CTranslUnit
-moveDeclsToTop = everywhere (mkT moveDeclsToTop')
+moveDeclsToTop = everywhere (mkT doMoveDecls)
   where
-    moveDeclsToTop' :: [CBlockItem]  -> [CBlockItem]
-    moveDeclsToTop' = moveDeclsToTop'' [] []
-    moveDeclsToTop'' ds nds (d@(CBlockDecl _):bs) = moveDeclsToTop'' (d:ds) nds bs
-    moveDeclsToTop'' ds nds (nd:bs) = moveDeclsToTop'' ds (nd:nds) bs
-    moveDeclsToTop'' ds nds [] = ds ++ nds
+    decls :: CFunDef -> [CDecl]
+    decls = listify (\ (_ :: CDecl) -> True)
+    removeDecls :: [CBlockItem] -> [CBlockItem]
+    removeDecls (CBlockDecl _:xs) = xs
+    removeDecls i = i
+    doMoveDecls :: CFunDef -> CFunDef
+    doMoveDecls fd = CFunDef declspecs declr decl (CCompound ns (ds++bis) sni) ni
+      where
+        ds = fmap CBlockDecl (decls fd)
+        (CFunDef declspecs declr decl (CCompound ns bis sni) ni)
+          = everywhere (mkT removeDecls) fd
 
 splitDeclsAndAssn :: CTranslUnit -> CTranslUnit
 splitDeclsAndAssn = everywhere (mkT splitDeclsAndAssn')
@@ -81,7 +95,7 @@ singleReturnify = everywhere (mkT returnifyFunction)
     returnifyBody :: [CDeclSpec] -> [CBlockItem] -> [CBlockItem]
     returnifyBody retType body = declRetval ++ updatedBlocks ++ newReturn
       where
-        retId = internalIdent "GENERATEDRETVAL" 
+        retId = internalIdent "GENERATEDRETVAL"
         retValDecl = CDeclr (Just $ retId) [] Nothing [] undefNode
         declRetval = [CBlockDecl $ CDecl retType [(Just retValDecl, Nothing, Nothing)] undefNode]
         updatedBlocks = everywhere (mkT returnToRetval) body
@@ -93,7 +107,7 @@ singleReturnify = everywhere (mkT returnifyFunction)
 
 simplifyControlFlow :: CTranslUnit -> CTranslUnit
 simplifyControlFlow = everywhere (mkT simplifyControlFlowFunc)
-  where 
+  where
     simplifyControlFlowFunc :: CFunDef -> CFunDef
     simplifyControlFlowFunc (CFunDef specs decl params (CCompound l b _) _) =
       (CFunDef specs decl params (CCompound l (simplifyControlFlowBlocks b []) undefNode) undefNode)

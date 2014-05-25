@@ -1,6 +1,6 @@
 module CExamples where
 
-import Utils
+import           Utils
 
   -- Loopy programs:
 loop1 = parseFromString $ "\
@@ -10,6 +10,16 @@ loop1 = parseFromString $ "\
 \     int y = x*x;\
 \     x += 1.2 * y;\
 \   }\
+\   return x;\
+\ }"
+
+loop1do = parseFromString $ "\
+\ int main() { \
+\   float x = 1.0f;\
+\   do {\
+\     int y = x*x;\
+\     x += 1.2 * y;\
+\   } while (x != 55);\
 \   return x;\
 \ }"
 
@@ -34,6 +44,7 @@ complicatedDecl = parseFromString $ "\
 \ int main () {\
 \   float a, b=2.0, *c, *d = 4;\
 \   static float n = 3, m;\
+\   m += n;\
 \   return 0;\
 \ }";
 
