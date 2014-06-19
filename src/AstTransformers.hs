@@ -1,3 +1,5 @@
+-- TODO: debug mode
+
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE FlexibleInstances         #-}
 {-# LANGUAGE IncoherentInstances       #-}
@@ -12,10 +14,11 @@ module AstTransformers where
 import           Control.Applicative ((<$>))
 import           Control.Monad.State
 import           Data.Data
+import           Data.Foldable       (foldlM)
 import           Data.Generics       hiding (empty)
 import           Data.Graph
 import           Data.List           (find, nub)
-import           Data.Map
+import           Data.Map            hiding (foldl, foldr)
 import           Data.Maybe          (fromJust)
 import           Language.C
 import           Unsafe.Coerce
@@ -24,15 +27,17 @@ import           Utils
 -- For playing in the REPL
 import           CExamples
 
+import           Debug.Trace
+
 -- TODO: How the heck do I do break/continue?
 -- TODO: assert the not at the end of the code!!!
-unrollLoops :: Int -> CTranslUnit -> CTranslUnit
+unrollLoops :: Integer -> CTranslUnit -> CTranslUnit
 unrollLoops n = everywhere (mkT unrollLoops')
   where
     ni = undefNode
-    unrollWhile :: CExpr -> CStat -> Int -> CStat
+    unrollWhile :: CExpr -> CStat -> Integer -> CStat
     unrollWhile expr stmt 0 = CIf expr stmt Nothing ni
-    unrollWhile expr stmt n = CIf expr rest Nothing ni
+    unrollWhile expr stmt _ = CIf expr rest Nothing ni
       where
         rest =
           case stmt of
@@ -50,7 +55,7 @@ removeAssnOps = everywhere (mkT removeAssnOps')
   where
     removeAssnOps' :: CExpr -> CExpr
     removeAssnOps' (CAssign op exprL exprR node) =
-      (CAssign CAssignOp exprL exprR' node)
+      CAssign CAssignOp exprL exprR' node
       where
         exprR' =
           case op of
@@ -87,15 +92,15 @@ splitDeclsAndAssn = everywhere (mkT splitDeclsAndAssn')
   where
     splitDeclsAndAssn' :: [CBlockItem] -> [CBlockItem]
     splitDeclsAndAssn' = concatMap splitDecl
-    splitDecl bd@(CBlockDecl (CDecl declspecs decls _)) = concatMap splitup decls
+    splitDecl (CBlockDecl (CDecl declspecs decls _)) = concatMap splitup decls
       where
-        splitup (declr@(Just declr'), i@(Just (CInitExpr initialier _)), expr) =
+        splitup (declr@(Just declr'), Just (CInitExpr initialier _), expr) =
           [CBlockDecl (CDecl declspecs [(declr, Nothing, expr)] undefNode),
            CBlockStmt (CExpr
                        (Just (CAssign CAssignOp (d2e declr') initialier undefNode))
                        undefNode)]
         -- initialization lists not supported (yet?):
-        splitup (declr@(Just declr'), i@(Just _), expr) =
+        splitup (Just _, Just _, _) =
           error "Initialization lists not supported"
         splitup di = [CBlockDecl (CDecl declspecs [di] undefNode)]
     splitDecl bi = [bi]
@@ -113,7 +118,7 @@ singleReturnify = everywhere (mkT returnifyFunction)
     returnifyBody retType body = declRetval ++ updatedBlocks ++ newReturn
       where
         retId = internalIdent "GENERATEDRETVAL"
-        retValDecl = CDeclr (Just $ retId) [] Nothing [] undefNode
+        retValDecl = CDeclr (Just retId) [] Nothing [] undefNode
         declRetval = [CBlockDecl $ CDecl retType [(Just retValDecl, Nothing, Nothing)] undefNode]
         updatedBlocks = everywhere (mkT returnToRetval) body
         newReturn = [CBlockStmt $ CReturn (Just $ CVar retId undefNode) undefNode]
@@ -127,7 +132,7 @@ simplifyControlFlow = everywhere (mkT simplifyControlFlowFunc)
   where
     simplifyControlFlowFunc :: CFunDef -> CFunDef
     simplifyControlFlowFunc (CFunDef specs decl params (CCompound l b _) _) =
-      (CFunDef specs decl params (CCompound l (simplifyControlFlowBlocks b []) undefNode) undefNode)
+      CFunDef specs decl params (CCompound l (simplifyControlFlowBlocks b []) undefNode) undefNode
     simplifyControlFlowBlocks :: [CBlockItem] -> [CBlockItem] -> [CBlockItem]
     simplifyControlFlowBlocks ((CBlockStmt (CIf cond cr mCe _)):bs) rest = [CBlockStmt newIf]
       where
@@ -243,9 +248,8 @@ gensym i n =
   let nameStr = identToString n
   in internalIdent $ "GENSYM_" ++ nameStr ++ "_" ++  show i
 
-linearizeFunCalls :: Data a => a -> [CFunDef] -> a
-linearizeFunCalls funDef defs =
-  evalState (everywhereM (mkM linearize) funDef) 1
+linearizeFunCalls :: Data a => a -> [CFunDef] -> State Integer a
+linearizeFunCalls funDef defs = everywhereM (mkM linearize) funDef
   where
     idToFunDef :: Ident -> State Integer CFunDef
     idToFunDef ident = do
@@ -287,8 +291,8 @@ linearizeFunCalls funDef defs =
     paramItems decls params = fmap doParamItem (zip decls params)
       where
         doParamItem (decl, param) =
-          let id = declId decl
-              var = CVar id undefNode
+          let ident = declId decl
+              var = CVar ident undefNode
               assign = CAssign CAssignOp var param undefNode
           in CBlockStmt $ CExpr (Just assign) undefNode
     --
@@ -300,8 +304,22 @@ linearizeFunCalls funDef defs =
           undefNode
         replace x = x
 
+linearize :: CTranslUnit -> CTranslUnit
+linearize tu = CTranslUnit (reverse $ fmap CFDefExt fundefs') undefNode
+  where
+    fundefs = do
+      tu' <- everywhereM (mkM seperateFnCalls) (splitDeclsAndAssn tu)
+      let fundefs = linearizedDecls tu'
+      foldlM linearizeIt [] fundefs
+    --
+    fundefs' = evalState fundefs 1
+    --
+    linearizeIt fns fn = do
+      fn' <- linearizeFunCalls fn fns
+      return $ fn':fns
+
 doit =
   let Just main = findFn (splitDeclsAndAssn example1) "main"
       defs = linearizedDecls (splitDeclsAndAssn example1)
       main2 = evalState (everywhereM (mkM seperateFnCalls) main) 1
-  in pretty $ linearizeFunCalls main2 defs
+  in linearizeFunCalls main2 defs

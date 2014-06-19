@@ -45,6 +45,9 @@ eOr :: [Expr] -> Expr
 eOr [] = eEmpty
 eOr es = App (I (N "or") []) Nothing es
 
+eNot :: Expr -> Expr
+eNot e = App (I (N "not") [] ) Nothing [e]
+
 eName :: String -> Expr
 eName name = App (I (N name) []) Nothing []
 
@@ -78,7 +81,7 @@ stmt2expr :: CStat -> Expr
 stmt2expr (CCompound _ block_items _) = eAnd $ block2exprs block_items
 stmt2expr (CExpr (Just e) _) = expr2expr e
 stmt2expr (CIf condExpr thenStmt (Just elseStmt) _) =
-  eOr [eAnd [condExpr', thenExpr], eAnd [condExpr', elseExpr]]
+  eOr [eAnd [condExpr', thenExpr], eAnd [eNot condExpr', elseExpr]]
   where
     condExpr' = expr2expr condExpr
     thenExpr = stmt2expr thenStmt
@@ -119,7 +122,7 @@ expr2expr (CBinary op left right _) =
         CLorOp -> "fp.or"
 expr2expr (CVar ident _) = eName . identToString $ ident
 expr2expr (CConst (CFloatConst (CFloat sf) _)) = fp2bv . read $  sf
-expr2expr (CConst (CIntConst (CInteger n _ _) _)) = Lit $ LitNum n
+expr2expr (CConst (CIntConst (CInteger n _ _) _)) = fp2bv . fromIntegral $ n
 -- TODO: we're gonna probably want to support this stuff
 -- expr2expr (CIndex (CExpression a) (CExpression a) _) = undefined
 -- expr2expr (CCall (CExpression a) [CExpression a] _) = undefined

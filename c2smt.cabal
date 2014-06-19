@@ -16,13 +16,12 @@ cabal-version:       >=1.8
 
 executable c2smt
   hs-source-dirs: src/
-  data-dir: c-examples/
   main-is: Main.hs
 
   build-depends: base,
+                 cmdargs,
                  language-c ==0.4.5,
                  syb,
-                 --uniplate,
                  smtLib,
                  data-binary-ieee754,
                  containers,
