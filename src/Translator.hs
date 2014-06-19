@@ -1,17 +1,21 @@
 {-# LANGUAGE FlexibleInstances     #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings     #-}
+{-# LANGUAGE ScopedTypeVariables   #-}
 {-# LANGUAGE TypeSynonymInstances  #-}
 module Translator (translate) where
 
 import           Data.Binary.IEEE754
 import           Data.Bits
-import           Data.Maybe          (catMaybes)
+import           Data.Generics
+import           Data.Maybe          (catMaybes, fromJust)
 import           Language.C
 import           SMTLib2
 import           Text.PrettyPrint
 
+import           AstTransformers
 import           CExamples
+import           Utils
 
 floatingPoint :: SMTLib2.Ident
 floatingPoint = I (N "FloatingPoint") [8, 24]
@@ -48,17 +52,10 @@ eEmpty :: Expr
 eEmpty = App (I (N "") []) Nothing []
 
 translate :: CTranslationUnit NodeInfo -> Script
-translate (CTranslUnit body _) = Script cmds
+translate tu = Script cmds
   where
-    findFn :: String -> [CExtDecl] -> CStat
-    findFn name (CFDefExt d:ds) = if name == name' then body' else findFn name ds
-      where
-        CFunDef _ (CDeclr (Just ident) _ _ _ _) _ body' _ = d
-        name' = identToString ident
-    findFn name (_:ds) = findFn name ds
-    findFn name [] = error ("No function called " ++ name ++ " found.")
-    CCompound _ block_items _ = findFn "main" body
-    cmds = [CmdSetLogic $ N "QF_FP"] ++ concatMap block2cmds block_items
+    CCompound _ block_items _ = fnBody . fromJust $ findFn tu "main"
+    cmds = (CmdSetLogic $ N "QF_FP") : concatMap block2cmds block_items
 
 block2cmds :: CBlockItem -> [Command]
 block2cmds (CBlockStmt stmt) = [stmt2cmd stmt]
@@ -95,6 +92,7 @@ stmt2expr (CIf condExpr thenStmt Nothing _) =
 stmt2expr (CExpr Nothing _) = undefined
 stmt2expr s = error $ "Unsupported statement passed to translator: " ++ show s
 
+-- Convert ints into float
 expr2expr :: CExpr -> Expr
 expr2expr (CAssign _ left right _) =
   App (I (N "fp.eq") []) Nothing [expr2expr left, expr2expr right]

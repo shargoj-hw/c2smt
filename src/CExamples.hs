@@ -1,82 +1,28 @@
 module CExamples where
 
+import           System.IO.Unsafe
 import           Utils
 
-  -- Loopy programs:
-loop1 = parseFromString $ "\
-\ int main() { \
-\   float x = 1.0f;\
-\   while (x != 55) {\
-\     int y = x*x;\
-\     x += 1.2 * y;\
-\   }\
-\   return x;\
-\ }"
+getDataFile name =
+  parseFromString
+   $ unsafePerformIO
+   $ do let filename = "../c-examples/" ++ name
+        readFile filename
 
-loop1do = parseFromString $ "\
-\ int main() { \
-\   float x = 1.0f;\
-\   do {\
-\     int y = x*x;\
-\     x += 1.2 * y;\
-\   } while (x != 55);\
-\   return x;\
-\ }"
+-- Loopy programs:
+loop1 = getDataFile "loop1.c"
+loop1do = getDataFile "loop1do.c"
+loop2 = getDataFile "loop2.c"
 
-loop2 = parseFromString $ "\
-\ int main() {\
-\   float x = 1.0f;\
-\   while (true)\
-\     x += 1.2 * x;\
-\   return x;\
-\ }"
+-- Do we handle declarations well?
+multiDecl = getDataFile "multiDecl.c"
+complicatedDecl = getDataFile "complicatedDecl.c"
 
-multiDecl = parseFromString $ "\
-\ int main () {\
-\   float x;\
-\   x = 3 * 9;\
-\   float y;\
-\   y += x + 3;\
-\   return 0;\
-\ }"
+-- Do our ifs look good?
+ifreturn1 = getDataFile "ifreturn1.c"
+ifreturn2 = getDataFile "ifreturn2.c"
+ifreturn3 = getDataFile "ifreturn3.c"
+ifreturn4 = getDataFile "ifreturn4.c"
 
-complicatedDecl = parseFromString $ "\
-\ int main () {\
-\   float a, b=2.0, *c, *d = 4;\
-\   static float n = 3, m;\
-\   m += n;\
-\   return 0;\
-\ }";
-
-ifreturn1 = parseFromString $ "\
-\ int main () {\
-\   float a;\
-\   if (true) {} \
-\   a = 3;\
-\   return a;\
-\}"
-
-ifreturn2 = parseFromString $ "\
-\ int main () {\
-\   float a;\
-\   if (true) {return 0;} \
-\   a = 3;\
-\   return a;\
-\}"
-
-ifreturn3 = parseFromString $ "\
-\ int main () {\
-\   float a;\
-\   if (true) {a += 2;} \
-\   a = 3;\
-\   return a;\
-\}"
-
-ifreturn4 = parseFromString $ "\
-\ int main () {\
-\   float a;\
-\   if (true) {a += 2;} \
-\   else return 4;\
-\   a = 3;\
-\   return a;\
-\}"
+-- Professor Wahl's Examples
+example1 = getDataFile "example1.c"
