@@ -11,13 +11,6 @@ import           Utils
 -- For repl stuff
 import           CExamples
 
-defaultConfig :: Config
-defaultConfig =
-  Config { loopUnrolls = 10
-                         &= help "Number of loop unrollings to performper loop"
-         , fileName = def &= argPos 0
-  }
-
 main :: IO ()
 main = do
   config <- cmdArgs defaultConfig
@@ -27,16 +20,16 @@ main = do
   print $ pretty tu
   putStrLn ""
   putStrLn "Translated:"
-  print $ doTranslate config tu
+--   print $ doTranslate config tu
 
-doTranslate :: Config -> CTranslUnit -> String
-doTranslate c tu = show . pp . translate $ runC2SMT c tu
+-- doTranslate :: Config -> CTranslUnit -> String
+-- doTranslate c tu = show . pp . translate $ runC2SMT c tu
 
-runC2SMT :: Config -> CTranslUnit -> CTranslUnit
-runC2SMT c =
-  simplifyControlFlow .
-  moveDeclsToTop .
-  removeAssnOps .
-  splitDeclsAndAssn .
-  singleReturnify .
-  unrollLoops (loopUnrolls c)
+-- runC2SMT :: Config -> CTranslUnit -> CTranslUnit
+-- runC2SMT c =
+--   simplifyControlFlow .
+--   moveDeclsToTop .
+--   removeAssnOps .
+--   splitDeclsAndAssn .
+--   singleReturnify .
+--   unrollLoops (loopUnrolls c)
