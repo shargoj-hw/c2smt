@@ -1,57 +1,82 @@
 -- TODO: debug mode
 
-{-# LANGUAGE ExistentialQuantification #-}
-{-# LANGUAGE FlexibleInstances         #-}
-{-# LANGUAGE IncoherentInstances       #-}
-{-# LANGUAGE LambdaCase                #-}
-{-# LANGUAGE NoMonomorphismRestriction #-}
-{-# LANGUAGE RankNTypes                #-}
-{-# LANGUAGE ScopedTypeVariables       #-}
-{-# LANGUAGE TypeSynonymInstances      #-}
+{-# LANGUAGE ExistentialQuantification  #-}
+{-# LANGUAGE FlexibleInstances          #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE IncoherentInstances        #-}
+{-# LANGUAGE LambdaCase                 #-}
+{-# LANGUAGE NoMonomorphismRestriction  #-}
+{-# LANGUAGE RankNTypes                 #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE TypeSynonymInstances       #-}
 
 module AstTransformers where
 
-import           Control.Applicative ((<$>))
+import           Control.Applicative  ((<$>))
+import           Control.Monad.Reader
 import           Control.Monad.State
 import           Data.Data
-import           Data.Foldable       (foldlM)
-import           Data.Generics       hiding (empty)
+import           Data.Foldable        (foldlM)
+import           Data.Generics        hiding (empty)
 import           Data.Graph
-import           Data.List           (find, nub)
-import           Data.Map            hiding (foldl, foldr)
-import           Data.Maybe          (fromJust)
+import           Data.List            (find, nub)
+import           Data.Map             hiding (foldl, foldr)
+import           Data.Maybe           (fromJust)
 import           Language.C
 import           Unsafe.Coerce
+
+import           Config
 import           Utils
 
 -- For playing in the REPL
 import           CExamples
-
 import           Debug.Trace
+
+-- This monad lets us implicitly pass around the config, keep track of
+-- the gensym counter, etc.
+
+type TransformerState = Integer
+
+newtype TransformerM a =
+  TM { unTM :: StateT TransformerState (Reader Config) a }
+  deriving (Monad, MonadReader Config, MonadState TransformerState)
+
+runTransformer :: TransformerM a -> Config -> a
+runTransformer a = runReader (evalStateT (unTM a) initialState)
+  where initialState = 1
 
 -- TODO: How the heck do I do break/continue?
 -- TODO: assert the not at the end of the code!!!
-unrollLoops :: Integer -> CTranslUnit -> CTranslUnit
-unrollLoops n = everywhere (mkT unrollLoops')
+unrollLoops :: Data a => a -> TransformerM a
+unrollLoops tu =
+  do n <- asks loopUnrolls
+     return $ unrollLoops n tu
   where
-    ni = undefNode
-    unrollWhile :: CExpr -> CStat -> Integer -> CStat
-    unrollWhile expr stmt 0 = CIf expr stmt Nothing ni
-    unrollWhile expr stmt _ = CIf expr rest Nothing ni
+    unrollLoops :: Data a => Integer -> a -> a
+    unrollLoops n = everywhere (mkT unrollLoops')
       where
-        rest =
-          case stmt of
-            CCompound is stmts _ -> CCompound is (stmts ++ [CBlockStmt $ unrollWhile expr stmt (n - 1)]) ni
-            s -> CCompound [] [CBlockStmt s, CBlockStmt $ unrollWhile expr stmt (n - 1)] ni
-    unrollLoops' :: CStat -> CStat
-    unrollLoops' (CWhile expr stmt isDoWhile _)
-      | not isDoWhile = unrollWhile expr stmt (n - 1)
-      | otherwise = CCompound [] [CBlockStmt stmt, CBlockStmt $ unrollWhile expr stmt (n - 1)]  ni
-    unrollLoops' (CFor init until update stmt node) = undefined init until update stmt node
-    unrollLoops' s = s
+        ni = undefNode
+        unrollWhile :: CExpr -> CStat -> Integer -> CStat
+        unrollWhile expr stmt 0 = CIf expr stmt Nothing ni
+        unrollWhile expr stmt _ = CIf expr rest Nothing ni
+          where
+            rest =
+              case stmt of
+                CCompound is stmts _ ->
+                  CCompound is
+                  (stmts ++ [CBlockStmt $ unrollWhile expr stmt (n - 1)]) ni
+                s ->
+                  CCompound []
+                  [CBlockStmt s, CBlockStmt $ unrollWhile expr stmt (n - 1)] ni
+        unrollLoops' :: CStat -> CStat
+        unrollLoops' (CWhile expr stmt isDoWhile _)
+          | not isDoWhile = unrollWhile expr stmt (n - 1)
+          | otherwise = CCompound [] [CBlockStmt stmt, CBlockStmt $ unrollWhile expr stmt (n - 1)]  ni
+        unrollLoops' (CFor init until update stmt node) = undefined init until update stmt node
+        unrollLoops' s = s
 
-removeAssnOps :: CTranslUnit -> CTranslUnit
-removeAssnOps = everywhere (mkT removeAssnOps')
+removeAssnOps :: Data a => a -> TransformerM a
+removeAssnOps tu = return $ everywhere (mkT removeAssnOps') tu
   where
     removeAssnOps' :: CExpr -> CExpr
     removeAssnOps' (CAssign op exprL exprR node) =
@@ -72,8 +97,8 @@ removeAssnOps = everywhere (mkT removeAssnOps')
             COrAssOp -> CBinary COrOp exprL exprR undefNode
     removeAssnOps' e = e
 
-moveDeclsToTop :: CTranslUnit -> CTranslUnit
-moveDeclsToTop = everywhere (mkT doMoveDecls)
+moveDeclsToTop :: Data a => a -> TransformerM a
+moveDeclsToTop a = return $ everywhere (mkT doMoveDecls) a
   where
     decls :: CFunDef -> [CDecl]
     decls = listify (\ (_ :: CDecl) -> True)
@@ -81,14 +106,15 @@ moveDeclsToTop = everywhere (mkT doMoveDecls)
     removeDecls (CBlockDecl _:xs) = xs
     removeDecls i = i
     doMoveDecls :: CFunDef -> CFunDef
-    doMoveDecls fd = CFunDef declspecs declr decl (CCompound ns (ds++bis) sni) ni
+    doMoveDecls fd =
+      CFunDef declspecs declr decl (CCompound ns (ds++bis) sni) ni
       where
         ds = fmap CBlockDecl (decls fd)
         (CFunDef declspecs declr decl (CCompound ns bis sni) ni)
           = everywhere (mkT removeDecls) fd
 
-splitDeclsAndAssn :: CTranslUnit -> CTranslUnit
-splitDeclsAndAssn = everywhere (mkT splitDeclsAndAssn')
+splitDeclsAndAssn :: Data a => a -> TransformerM a
+splitDeclsAndAssn a = return $ everywhere (mkT splitDeclsAndAssn') a
   where
     splitDeclsAndAssn' :: [CBlockItem] -> [CBlockItem]
     splitDeclsAndAssn' = concatMap splitDecl
@@ -106,8 +132,8 @@ splitDeclsAndAssn = everywhere (mkT splitDeclsAndAssn')
     splitDecl bi = [bi]
     d2e (CDeclr (Just i) _ _ _ _) = CVar i undefNode
 
-singleReturnify :: CTranslUnit -> CTranslUnit
-singleReturnify = everywhere (mkT returnifyFunction)
+singleReturnify :: Data a => a -> TransformerM a
+singleReturnify a = return $ everywhere (mkT returnifyFunction) a
   where
     returnifyFunction :: CFunDef -> CFunDef
     returnifyFunction (CFunDef specs decl params body _) =
@@ -127,8 +153,8 @@ singleReturnify = everywhere (mkT returnifyFunction)
           CExpr (Just $ CAssign CAssignOp (CVar retId undefNode) v undefNode) undefNode
         returnToRetval s = s
 
-simplifyControlFlow :: CTranslUnit -> CTranslUnit
-simplifyControlFlow = everywhere (mkT simplifyControlFlowFunc)
+simplifyControlFlow :: Data a => a -> TransformerM a
+simplifyControlFlow a = return $ everywhere (mkT simplifyControlFlowFunc) a
   where
     simplifyControlFlowFunc :: CFunDef -> CFunDef
     simplifyControlFlowFunc (CFunDef specs decl params (CCompound l b _) _) =
@@ -152,45 +178,40 @@ simplifyControlFlow = everywhere (mkT simplifyControlFlowFunc)
 
 ---- Function Inlining stuff
 
-nameToCalls :: CTranslUnit -> [(String, [String])]
-nameToCalls tu = fmap
-                 (\ fd->
-                   (getFunName fd,
-                    nub $ fmap getId (listify isCall fd)))
-                 decls
-  where
-    isCall :: CExpr -> Bool
-    isCall (CCall (CVar _ _) _ _) = True
-    isCall _ = False
-    getId :: CExpr -> String
-    getId (CCall (CVar ident _) _ _) = identToString ident
-    getFunName :: CFunDef -> String
-    getFunName (CFunDef _ (CDeclr (Just ident) _ _ _ _) _ _ _) =
-      identToString ident
-    decls = listify (\ (_ :: CFunDef) -> True) tu
-
-tuGraph ::
-     CTranslUnit
-     -> (Graph,
-         Vertex -> (Integer, String, [String]),
-         String -> Maybe Vertex)
-tuGraph tu = graphFromEdges
-             $ (\(a,(b,c))->(a,b,c))
-             <$> zip [1..] (nameToCalls tu)
-
-linearizedDecls :: CTranslUnit -> [CFunDef]
-linearizedDecls tu = calls
+fundefsOrderedByCalls :: CTranslUnit -> [CFunDef]
+fundefsOrderedByCalls tu = calls
   where
     (g, toN, _) = tuGraph tu
+    --
     calls = fmap (fromJust . findFn tu . (\(_,b,_)->b) . toN)
             $ reverse
             $ topSort g
+    --
+    tuGraph tu = graphFromEdges $
+                 (\(a,(b,c))->(a,b,c)) <$>
+                 zip [1..] (nameToCalls tu)
+    --
+    nameToCalls tu = fmap
+                     (\ fd->
+                       (getFunName fd,
+                        nub $ fmap getId (listify (isCall) fd)))
+                     decls
+    --
+    isCall :: CExpr -> Bool
+    isCall (CCall (CVar _ _) _ _) = True
+    isCall _ = False
+    --
+    getId (CCall (CVar ident _) _ _) = identToString ident
+    --
+    getFunName :: CFunDef -> String
+    getFunName (CFunDef _ (CDeclr (Just ident) _ _ _ _) _ _ _) =
+      identToString ident
+    --
+    decls = listify (\ (_ :: CFunDef) -> True) tu
 
-seperateFnCalls :: CStatement NodeInfo -> State Integer (CStatement NodeInfo)
+seperateFnCalls :: CStat -> TransformerM CStat
 seperateFnCalls (CCompound ids stmts _) = do
-  i <- get
-  let (newcalls, i') = runState (mapM seperateFnCallsBlockM stmts) i
-  put i'
+  newcalls <- mapM seperateFnCallsBlockM stmts
   return $ CCompound ids (concat newcalls) undefNode
   where
     seperateFnCallsExprM :: CExpr -> State (Integer, [(Ident, CExpr)]) CExpr
@@ -201,7 +222,7 @@ seperateFnCalls (CCompound ids stmts _) = do
       return $ CVar newId undefNode
     seperateFnCallsExprM e = return e
     --
-    seperateFnCallsBlockM :: CBlockItem -> State Integer [CBlockItem]
+    seperateFnCallsBlockM :: CBlockItem -> TransformerM [CBlockItem]
     seperateFnCallsBlockM (CBlockStmt s) = do
       n <- get
       let (s', (n', calls)) =
@@ -248,10 +269,10 @@ gensym i n =
   let nameStr = identToString n
   in internalIdent $ "GENSYM_" ++ nameStr ++ "_" ++  show i
 
-linearizeFunCalls :: Data a => a -> [CFunDef] -> State Integer a
+linearizeFunCalls :: Data a => a -> [CFunDef] -> TransformerM a
 linearizeFunCalls funDef defs = everywhereM (mkM linearize) funDef
   where
-    idToFunDef :: Ident -> State Integer CFunDef
+    idToFunDef :: Ident -> TransformerM CFunDef
     idToFunDef ident = do
       let name = identToString ident
           -- This will have to change when we support stuff like sqrt
@@ -261,13 +282,13 @@ linearizeFunCalls funDef defs = everywhereM (mkM linearize) funDef
       put i'
       return fn'
     --
-    linearize :: CStat -> State Integer CStat
+    linearize :: CStat -> TransformerM CStat
     linearize (CCompound ids stmts _) = do
       stmts' <- mapM linearizeStmt stmts
       return $ CCompound ids (concat stmts') undefNode
     linearize s = return s
     --
-    linearizeStmt :: CBlockItem -> State Integer [CBlockItem]
+    linearizeStmt :: CBlockItem -> TransformerM [CBlockItem]
     linearizeStmt cb@(CBlockDecl d@(CDecl _ decls _))
       | linearizble decls = do
         let linearizeDecl (Just declr, Just (CInitExpr expr _), _) = do
@@ -304,22 +325,21 @@ linearizeFunCalls funDef defs = everywhereM (mkM linearize) funDef
           undefNode
         replace x = x
 
-linearize :: CTranslUnit -> CTranslUnit
-linearize tu = CTranslUnit (reverse $ fmap CFDefExt fundefs') undefNode
+linearize :: CTranslUnit -> TransformerM CTranslUnit
+linearize tu = do tu' <- splitDeclsAndAssn tu
+                  tu'' <- everywhereM (mkM seperateFnCalls) tu'
+                  let fundefs = fundefsOrderedByCalls tu''
+                  fundefs' <- foldlM linearizeIt [] fundefs
+                  return $
+                    CTranslUnit (reverse $ fmap CFDefExt fundefs') undefNode
   where
-    fundefs = do
-      tu' <- everywhereM (mkM seperateFnCalls) (splitDeclsAndAssn tu)
-      let fundefs = linearizedDecls tu'
-      foldlM linearizeIt [] fundefs
-    --
-    fundefs' = evalState fundefs 1
-    --
+    linearizeIt :: [CFunDef] -> CFunDef -> TransformerM [CFunDef]
     linearizeIt fns fn = do
       fn' <- linearizeFunCalls fn fns
       return $ fn':fns
 
-doit =
-  let Just main = findFn (splitDeclsAndAssn example1) "main"
-      defs = linearizedDecls (splitDeclsAndAssn example1)
-      main2 = evalState (everywhereM (mkM seperateFnCalls) main) 1
-  in linearizeFunCalls main2 defs
+-- doit =
+--   let Just main = findFn (splitDeclsAndAssn example1) "main"
+--       defs = fundefsOrderedByCalls (splitDeclsAndAssn example1)
+--       main2 = evalState (everywhereM (mkM seperateFnCalls) main) 1
+--   in linearizeFunCalls main2 defs
