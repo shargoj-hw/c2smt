@@ -17,19 +17,8 @@ main = do
   let fn = fileName config
   cprog <- readFile fn
   let tu = parseFromString cprog
+  putStrLn "Original:"
   print $ pretty tu
   putStrLn ""
   putStrLn "Translated:"
---   print $ doTranslate config tu
-
--- doTranslate :: Config -> CTranslUnit -> String
--- doTranslate c tu = show . pp . translate $ runC2SMT c tu
-
--- runC2SMT :: Config -> CTranslUnit -> CTranslUnit
--- runC2SMT c =
---   simplifyControlFlow .
---   moveDeclsToTop .
---   removeAssnOps .
---   splitDeclsAndAssn .
---   singleReturnify .
---   unrollLoops (loopUnrolls c)
+  print . pp . translate . runTransformer config . transform $ tu
