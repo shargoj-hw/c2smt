@@ -1,5 +1,3 @@
--- TODO: debug mode
-
 {-# LANGUAGE ExistentialQuantification  #-}
 {-# LANGUAGE FlexibleInstances          #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
@@ -32,22 +30,27 @@ import           Utils
 -- For playing in the REPL
 import           CExamples
 
--- This monad lets us implicitly pass around the config, keep track of
--- the gensym counter, etc.
 
+-- | Encapsulates all of the mutable state required by 'TransformerM'
 type TransformerState = Integer
 
+-- | This monad lets us implicitly pass around the config, keep track of
+-- the gensym counter, etc.
 newtype TransformerM a =
   TM { unTM :: StateT TransformerState (Reader Config) a }
   deriving (Monad, MonadReader Config, MonadState TransformerState)
 
+-- | Runs the transformation using the given config.
 runTransformer ::  Config -> TransformerM a  -> a
 runTransformer c a = runReader (evalStateT (unTM a) initialState) c
   where initialState = 1
 
+-- | Runs the transformation using the default config
 runTransformer_ :: TransformerM a -> a
 runTransformer_ = runTransformer defaultConfig
 
+-- | List of all of the transformation functions in the order they
+-- should be applied, along with their name-strings for debugging.
 transformerSteps :: [(CTranslUnit -> TransformerM CTranslUnit, String)]
 transformerSteps =
   [
@@ -60,6 +63,8 @@ transformerSteps =
     (moveDeclsToTop, "moveDeclsToTop")
   ]
 
+-- | Combines everything from 'transformerSteps', tracing each step if
+-- in debug mode.
 transform :: CTranslUnit -> TransformerM CTranslUnit
 transform tu = foldM app tu transformerSteps
   where app tu (t, s) =
@@ -70,6 +75,7 @@ transform tu = foldM app tu transformerSteps
 
 -- TODO: How the heck do I do break/continue?
 -- TODO: assert the not at the end of the code!!!
+-- | Unrolls each loop 'loopUnrolls' number of times.
 unrollLoops :: Data a => a -> TransformerM a
 unrollLoops tu =
   do n <- asks loopUnrolls
@@ -99,6 +105,7 @@ unrollLoops tu =
         unrollLoops' (CFor init until update stmt node) = undefined init until update stmt node
         unrollLoops' s = s
 
+-- | Replaces e.g., a += b with a = a + b.
 removeAssnOps :: Data a => a -> TransformerM a
 removeAssnOps tu = return $ everywhere (mkT removeAssnOps') tu
   where
@@ -121,6 +128,7 @@ removeAssnOps tu = return $ everywhere (mkT removeAssnOps') tu
             COrAssOp -> CBinary COrOp exprL exprR un
     removeAssnOps' e = e
 
+-- | Takes every declaration and moves it to the top.
 moveDeclsToTop :: Data a => a -> TransformerM a
 moveDeclsToTop a = return $ everywhere (mkT doMoveDecls) a
   where
@@ -137,6 +145,7 @@ moveDeclsToTop a = return $ everywhere (mkT doMoveDecls) a
         (CFunDef declspecs declr decl (CCompound ns bis sni) ni)
           = everywhere (mkT removeDecls) fd
 
+-- | Replaces e.g., float a = 3 with float a; a = 3.
 splitDeclsAndAssn :: Data a => a -> TransformerM a
 splitDeclsAndAssn a = return $ everywhere (mkT splitDeclsAndAssn') a
   where
@@ -156,6 +165,7 @@ splitDeclsAndAssn a = return $ everywhere (mkT splitDeclsAndAssn') a
     splitDecl bi = [bi]
     d2e (CDeclr (Just i) _ _ _ _) = CVar i un
 
+-- | Transforms functions to only return once, at the end.
 singleReturnify :: Data a => a -> TransformerM a
 singleReturnify a = return $ everywhere (mkT returnifyFunction) a
   where
@@ -177,6 +187,8 @@ singleReturnify a = return $ everywhere (mkT returnifyFunction) a
           CExpr (Just $ CAssign CAssignOp (CVar retId un) v un) un
         returnToRetval s = s
 
+-- | Reorders a C program so that there are no statements after
+-- conditionals.
 simplifyControlFlow :: Data a => a -> TransformerM a
 simplifyControlFlow a = return $ everywhere (mkT simplifyControlFlowFunc) a
   where
@@ -202,6 +214,8 @@ simplifyControlFlow a = return $ everywhere (mkT simplifyControlFlowFunc) a
 
 ---- Function Inlining stuff
 
+-- | Returns a list of the function definitions in order of the least
+-- calls to other functions to the most.
 fundefsOrderedByCalls :: CTranslUnit -> [CFunDef]
 fundefsOrderedByCalls tu = calls
   where
@@ -233,6 +247,11 @@ fundefsOrderedByCalls tu = calls
     --
     decls = listify (\ (_ :: CFunDef) -> True) tu
 
+-- | Rewrites expressions, declaring new variables for each function
+-- call in the expression and replacing the calls with them.
+--
+-- NOTE: The new declarations are of the form float foo_call_3 =
+-- foo(4). This form is required by linearize.
 seperateFnCalls :: CStat -> TransformerM CStat
 seperateFnCalls (CCompound ids stmts _) = do
   newcalls <- mapM seperateFnCallsBlockM stmts
@@ -266,6 +285,7 @@ type Env = Map Ident Ident
 
 type UNState a = State (Integer, Env) a
 
+-- | Gensyms new names for each variable in the program.
 uniqueNameify :: Data a => a -> State (Integer, Env) a
 uniqueNameify = everywhereM' uniqueNameify'
   where
@@ -289,11 +309,14 @@ uniqueNameify = everywhereM' uniqueNameify'
       return $ CVar (idMap ! ident) ni
     uniqueNamesE e = return e
 
+-- | Creates a new variable name.
 gensym :: Show a => a -> Ident -> Ident
 gensym i n =
   let nameStr = identToString n
   in internalIdent $ "GENSYM_" ++ nameStr ++ "_" ++  show i
 
+-- | Replaces all calls (after seperateFnCalls has been run on the
+-- data) with the functions found in defs.
 linearizeFunCalls :: Data a => a -> [CFunDef] -> TransformerM a
 linearizeFunCalls funDef defs = everywhereM (mkM linearize) funDef
   where
@@ -350,11 +373,14 @@ linearizeFunCalls funDef defs = everywhereM (mkM linearize) funDef
           un
         replace x = x
 
+-- | Linearizes all function calls.
 linearize :: CTranslUnit -> TransformerM CTranslUnit
 linearize tu = do tu' <- splitDeclsAndAssn tu
                   tu'' <- everywhereM (mkM seperateFnCalls) tu'
                   let fundefs = fundefsOrderedByCalls tu''
                   fundefs' <- foldlM linearizeIt [] fundefs
+                  -- This is lazy on my part and removes global
+                  -- variables. When those go in, this has to change.
                   return $
                     CTranslUnit (reverse $ fmap CFDefExt fundefs') un
   where
@@ -363,9 +389,6 @@ linearize tu = do tu' <- splitDeclsAndAssn tu
       fn' <- linearizeFunCalls fn fns
       return $ fn':fns
 
+-- | Saves on typing.
+un :: NodeInfo
 un = undefNode
-
-doit = pretty . runTransformer_ $ do
-  tu <- linearize example1
-  let Just main = findFn tu "main"
-  linearize tu
