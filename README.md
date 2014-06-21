@@ -1,1 +1,1 @@
-Translator from C to SMP.
+Translator from C to SMT.
