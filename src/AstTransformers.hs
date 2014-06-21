@@ -67,11 +67,11 @@ transformerSteps =
 -- in debug mode.
 transform :: CTranslUnit -> TransformerM CTranslUnit
 transform tu = foldM app tu transformerSteps
-  where app tu (t, s) =
+  where app v (t, s) =
           do debug <- asks debugMode
-             tu' <- t tu
-             let deb = ("---> "++ s ++ ": \n" ++ show (pretty tu'))
-             return $ if debug then trace deb tu' else tu'
+             v' <- t v
+             let deb = "---> "++ s ++ ": \n" ++ show (pretty v')
+             return $ if debug then trace deb v' else v'
 
 -- TODO: How the heck do I do break/continue?
 -- TODO: assert the not at the end of the code!!!
@@ -79,11 +79,20 @@ transform tu = foldM app tu transformerSteps
 unrollLoops :: Data a => a -> TransformerM a
 unrollLoops tu =
   do n <- asks loopUnrolls
-     return $ unrollLoops n tu
+     return $ doUnrollLoops n tu
   where
-    unrollLoops :: Data a => Integer -> a -> a
-    unrollLoops n = everywhere (mkT unrollLoops')
+    doUnrollLoops :: Data a => Integer -> a -> a
+    doUnrollLoops n = everywhere (mkT unrollLoops')
       where
+        unrollLoops' (CWhile expr stmt isDoWhile _)
+          | not isDoWhile = unrollWhile expr stmt (n - 1)
+          | otherwise = CCompound [] [CBlockStmt stmt,
+                                      CBlockStmt
+                                      $ unrollWhile expr stmt (n - 1)]  un
+        unrollLoops' (CFor init until update stmt node) =
+          undefined init until update stmt node
+        unrollLoops' s = s
+        --
         unrollWhile :: CExpr -> CStat -> Integer -> CStat
         unrollWhile expr stmt 0 = CIf expr stmt Nothing un
         unrollWhile expr stmt _ = CIf expr rest Nothing un
@@ -96,14 +105,6 @@ unrollLoops tu =
                 s ->
                   CCompound []
                   [CBlockStmt s, CBlockStmt $ unrollWhile expr stmt (n - 1)] un
-        unrollLoops' :: CStat -> CStat
-        unrollLoops' (CWhile expr stmt isDoWhile _)
-          | not isDoWhile = unrollWhile expr stmt (n - 1)
-          | otherwise = CCompound [] [CBlockStmt stmt,
-                                      CBlockStmt
-                                      $ unrollWhile expr stmt (n - 1)]  un
-        unrollLoops' (CFor init until update stmt node) = undefined init until update stmt node
-        unrollLoops' s = s
 
 -- | Replaces e.g., a += b with a = a + b.
 removeAssnOps :: Data a => a -> TransformerM a
@@ -196,21 +197,21 @@ simplifyControlFlow a = return $ everywhere (mkT simplifyControlFlowFunc) a
     simplifyControlFlowFunc (CFunDef specs decl params (CCompound l b _) _) =
       CFunDef specs decl params (CCompound l (simplifyControlFlowBlocks b []) un) un
     simplifyControlFlowBlocks :: [CBlockItem] -> [CBlockItem] -> [CBlockItem]
-    simplifyControlFlowBlocks ((CBlockStmt (CIf cond cr mCe _)):bs) rest = [CBlockStmt newIf]
+    simplifyControlFlowBlocks (CBlockStmt (CIf cond cr mCe _):bs) rest = [CBlockStmt newIf]
       where
-        newRest = (simplifyControlFlowBlocks bs rest) ++ rest
+        newRest = simplifyControlFlowBlocks bs rest ++ rest
         sCFStmt :: CStat -> CStat
         sCFStmt r@(CReturn _ _) = r
         sCFStmt (CCompound lbls stmts _) = CCompound lbls (simplifyControlFlowBlocks stmts newRest) un
-        sCFStmt s = CCompound [] ((CBlockStmt s):newRest) un
+        sCFStmt s = CCompound [] (CBlockStmt s:newRest) un
         newIf =
           case mCe of
             Just ce -> CIf cond (sCFStmt cr) (Just $ sCFStmt ce) un
             Nothing -> CIf cond (sCFStmt cr) (Just $ CCompound [] newRest un) un
     simplifyControlFlowBlocks [] rest = rest
     simplifyControlFlowBlocks (s@(CBlockStmt (CReturn _ _)):[]) _ = [s]
-    simplifyControlFlowBlocks ((CBlockStmt (CReturn _ _)):_:_) _ = error "Code found after a return!"
-    simplifyControlFlowBlocks (b:bs) rest = b:(simplifyControlFlowBlocks bs rest)
+    simplifyControlFlowBlocks (CBlockStmt (CReturn _ _):_:_) _ = error "Code found after a return!"
+    simplifyControlFlowBlocks (b:bs) rest = b:simplifyControlFlowBlocks bs rest
 
 ---- Function Inlining stuff
 
@@ -219,21 +220,20 @@ simplifyControlFlow a = return $ everywhere (mkT simplifyControlFlowFunc) a
 fundefsOrderedByCalls :: CTranslUnit -> [CFunDef]
 fundefsOrderedByCalls tu = calls
   where
-    (g, toN, _) = tuGraph tu
-    --
     calls = fmap (fromJust . findFn tu . (\(_,b,_)->b) . toN)
             $ reverse
             $ topSort g
     --
-    tuGraph tu = graphFromEdges $
-                 (\(a,(b,c))->(a,b,c)) <$>
-                 zip [1..] (nameToCalls tu)
+    (g, toN :: Vertex -> (Integer, String, [String]), _) = tuGraph
     --
-    nameToCalls tu = fmap
-                     (\ fd->
-                       (getFunName fd,
-                        nub $ fmap getId (listify (isCall) fd)))
-                     decls
+    tuGraph =
+      graphFromEdges $ (\(a,(b,c))->(a,b,c)) <$> zip [1..] nameToCalls
+    --
+    nameToCalls = fmap
+                  (\ fd->
+                    (getFunName fd,
+                     nub $ fmap getId (listify isCall fd)))
+                  decls
     --
     isCall :: CExpr -> Bool
     isCall (CCall (CVar _ _) _ _) = True
