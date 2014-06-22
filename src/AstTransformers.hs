@@ -60,6 +60,7 @@ transformerSteps =
     (removeAssnOps, "removeAssnOps"),
     (splitDeclsAndAssn, "splitDeclsAndAssn"),
     (linearize, "linearize"),
+    (ssaAll, "ssaAll"),
     (moveDeclsToTop, "moveDeclsToTop")
   ]
 
@@ -95,7 +96,7 @@ unrollLoops tu =
         --
         unrollWhile :: CExpr -> CStat -> Integer -> CStat
         unrollWhile expr stmt 0 = CIf expr stmt Nothing un
-        unrollWhile expr stmt _ = CIf expr rest Nothing un
+        unrollWhile expr stmt n' = CIf expr rest Nothing un
           where
             rest =
               case stmt of
@@ -286,7 +287,7 @@ type Env = Map Ident Ident
 type UNState a = State (Integer, Env) a
 
 -- | Gensyms new names for each variable in the program.
-uniqueNameify :: Data a => a -> State (Integer, Env) a
+uniqueNameify :: Data a => a -> UNState a
 uniqueNameify = everywhereM' uniqueNameify'
   where
     uniqueNameify' :: forall a. Typeable a => a -> UNState a
@@ -388,6 +389,76 @@ linearize tu = do tu' <- splitDeclsAndAssn tu
     linearizeIt fns fn = do
       fn' <- linearizeFunCalls fn fns
       return $ fn':fns
+
+type SSAState a = State (Integer, Env, [Ident]) a
+
+-- | Performs Single Static Assignment across the program. Expects the
+-- program to have been linearized.
+ssa :: CFunDef -> TransformerM CFunDef
+ssa fd = do
+  i <- get
+  let CFunDef dss d ds (CCompound ids stmts _) _ = fd
+      (stmts', (i', _, newIdents)) =
+        runState (everywhereM doSSA stmts) (i, empty, [])
+      decls = fmap floatDecl newIdents
+  put i'
+  return $ CFunDef dss d ds (CCompound ids (decls++stmts') un) un
+  where
+    doSSA :: forall a. Typeable a => a -> SSAState a
+    doSSA a
+      | typesMatch a (undefined :: CExpression NodeInfo) =
+        unsafeCoerce $ ssaE (unsafeCoerce a)
+      | typesMatch a (undefined :: CDeclarator NodeInfo) =
+          unsafeCoerce $ ssaD (unsafeCoerce a)
+      | otherwise = return a
+    --
+    ssaD :: CDeclr -> SSAState CDeclr
+    ssaD cd@(CDeclr (Just ident) _ _ _ _) = do
+      (i, idMap, newIdents) <- get
+      put (i, insert ident ident idMap, newIdents)
+      return cd
+    --
+    ssaE :: CExpr -> SSAState CExpr
+    ssaE (CVar ident ni) = do
+      (_, idMap, _) <- get
+      return $ CVar (mapGet ident idMap) ni
+    ssaE (CAssign op (CVar ident ni) rhs _) = do
+      (i, _, _) <- get
+      let ident' = gensym i ident
+      tempVarsInRhs <- temp ident
+      tempNewVar <- temp ident
+      let rep c@(CVar identRep _) =
+            if identRep == ident
+            then CVar tempVarsInRhs un
+            else c
+          rep e = e
+      modify (\(i, m, l) ->
+               (i+1,
+                insert ident ident'
+                (insert tempVarsInRhs ident
+                 (insert tempNewVar ident' m)),
+                ident':l))
+      return (CAssign op (CVar tempNewVar ni) (everywhere (mkT rep) rhs) un)
+    ssaE e = return e
+    --
+    temp n = do
+      (i, m, l) <- get
+      let nameStr = identToString n
+      put (i+1, m, l)
+      return $ internalIdent $ "TEMP_" ++ nameStr ++ "_" ++  show i
+
+    --
+    mapGet k map = if member k map then map ! k else k
+    --
+    floatDecl ident = CBlockDecl $ CDecl [CTypeSpec (CFloatType un)]
+                      [(Just $ CDeclr (Just ident) [] Nothing [] un,
+                        Nothing,
+                        Nothing)]
+                      un
+
+-- | Performs SSA everywhere.
+ssaAll :: CTranslUnit -> TransformerM CTranslUnit
+ssaAll = everywhereM (mkM ssa)
 
 -- | Saves on typing.
 un :: NodeInfo
