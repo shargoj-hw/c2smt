@@ -19,7 +19,7 @@ import           Data.Generics        hiding (empty)
 import           Data.Graph
 import           Data.List            (find, nub)
 import           Data.Map             hiding (foldl, foldr)
-import           Data.Maybe           (fromJust)
+import           Data.Maybe           (fromJust, fromMaybe, maybeToList)
 import           Debug.Trace
 import           Language.C
 import           Unsafe.Coerce
@@ -90,8 +90,14 @@ unrollLoops tu =
           | otherwise = CCompound [] [CBlockStmt stmt,
                                       CBlockStmt
                                       $ unrollWhile expr stmt (n - 1)]  un
-        unrollLoops' (CFor init until update stmt node) =
-          undefined init until update stmt node
+        unrollLoops' (CFor init until update stmt _) =
+          CCompound [] [initItem, CBlockStmt $ unrollFor cond update stmt n] un
+          where
+            initItem =
+              case init of
+                Left e -> CBlockStmt $ CExpr e undefNode
+                Right decl  -> CBlockDecl decl
+            cond = fromMaybe (CVar (internalIdent "true") un) until
         unrollLoops' s = s
         --
         unrollWhile :: CExpr -> CStat -> Integer -> CStat
@@ -102,10 +108,21 @@ unrollLoops tu =
               case stmt of
                 CCompound is stmts _ ->
                   CCompound is
-                  (stmts ++ [CBlockStmt $ unrollWhile expr stmt (n - 1)]) un
+                  (stmts ++ [CBlockStmt $ unrollWhile expr stmt (n' - 1)]) un
                 s ->
                   CCompound []
-                  [CBlockStmt s, CBlockStmt $ unrollWhile expr stmt (n - 1)] un
+                  [CBlockStmt s, CBlockStmt $ unrollWhile expr stmt (n' - 1)] un
+        --
+        unrollFor :: CExpr -> Maybe CExpr -> CStat -> Integer -> CStat
+        unrollFor cond update body n = CIf cond body' Nothing un
+          where
+            body' =
+              (compoundWith body (\s -> update' ++ s ++ rest))
+            update' =
+              fmap (\s -> CBlockStmt . flip CExpr un . Just $ s) (maybeToList update)
+            rest =
+              if n == 0 then [] else [CBlockStmt $ unrollFor cond update body (n-1)]
+
 
 -- | Replaces e.g., a += b with a = a + b.
 removeAssnOps :: Data a => a -> TransformerM a

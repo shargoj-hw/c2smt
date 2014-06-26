@@ -45,3 +45,7 @@ declId (CDecl _ ((Just (CDeclr (Just ident) _ _ _ _), _, _):_) _) =  ident
 
 typesMatch :: (Typeable a, Typeable b) => a -> b -> Bool
 typesMatch a b = typeOf a == typeOf b
+
+compoundWith :: CStat -> ([CBlockItem] -> [CBlockItem]) -> CStat
+compoundWith (CCompound ids stmts _) t = CCompound ids (t stmts) undefNode
+compoundWith s t = CCompound [] (t [CBlockStmt s]) undefNode
