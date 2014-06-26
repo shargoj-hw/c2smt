@@ -17,90 +17,57 @@ import           AstTransformers
 import           CExamples
 import           Utils
 
-floatingPoint :: SMTLib2.Ident
-floatingPoint = I (N "FloatingPoint") [8, 24]
+-- * Translation Functions
 
--- TODO: make sure this is right in terms of endianness, etc
-splitFP :: Float -> (Integer, Integer, Integer)
-splitFP f = (nanbit, integerize top 0, integerize bottom 0)
-  where
-    bits = map (\b -> if testBit (floatToWord f) b then 1 else 0) [0..32]
-    (nanbit, top, bottom) = (bits !! 8, take 8 bits, drop 9 bits)
-    integerize bs n = foldl (\num b-> shiftL (b .|. num) 1) n bs
-
-fp2bv :: Float -> Expr
-fp2bv f = App (I (N "fp") []) Nothing [Lit nanbit', Lit top', Lit bottom']
-  where
-    (nanbit, top, bottom) = splitFP f
-    (nanbit', top', bottom') = (LitBV nanbit 1, LitBV top 8, LitBV bottom 23)
-
-floatDecl :: String -> Command
-floatDecl name = CmdDeclareFun (N name) [] (TApp floatingPoint [])
-
-eAnd :: [Expr] -> Expr
-eAnd [] = eEmpty
-eAnd es = App (I (N "and") []) Nothing es
-
-eOr :: [Expr] -> Expr
-eOr [] = eEmpty
-eOr es = App (I (N "or") []) Nothing es
-
-eNot :: Expr -> Expr
-eNot e = App (I (N "not") [] ) Nothing [e]
-
-eName :: String -> Expr
-eName name = App (I (N name) []) Nothing []
-
-eEmpty :: Expr
-eEmpty = App (I (N "") []) Nothing []
-
-translate :: CTranslationUnit NodeInfo -> Script
+-- | Translates a [limited] C AST to an SMTLib AST. The output is the
+-- body of the main function.
+translate :: CTranslUnit -> Script
 translate tu = Script cmds
   where
     CCompound _ block_items _ = fnBody . fromJust $ findFn tu "main"
-    cmds = (CmdSetLogic $ N "QF_FP") : concatMap block2cmds block_items
+    cmds = (CmdSetLogic $ N "QF_FP") : concatMap translateTopLevel block_items
 
-block2cmds :: CBlockItem -> [Command]
-block2cmds (CBlockStmt stmt) = [stmt2cmd stmt]
-block2cmds (CBlockDecl decl) = fmap floatDecl ids
+-- | Translates statements and declarations in the body of the "main"
+-- function.
+translateTopLevel :: CBlockItem -> [Command]
+translateTopLevel (CBlockStmt stmt) = [translateTopLevelStmt stmt]
+translateTopLevel (CBlockDecl decl) = fmap floatDecl ids
   where
     CDecl _ decls _ = decl
     ids = fmap identToString $
           catMaybes $ fmap (\(CDeclr ident _ _ _ _)->ident) $
           catMaybes $ fmap (\(declr, _, _) -> declr) decls
 
-block2exprs :: [CBlockItem] -> [Expr]
-block2exprs =
-  fmap stmt2expr . catMaybes . fmap (\i -> case i of CBlockStmt s -> Just s; _ -> Nothing)
+-- | Translates a statement and asserts it.
+translateTopLevelStmt :: CStat -> Command
+translateTopLevelStmt (CReturn _ _) = CmdExit
+translateTopLevelStmt stmt = CmdAssert . translateStmt $ stmt
 
-stmt2cmd :: CStat -> Command
-stmt2cmd (CReturn _ _) = CmdExit
-stmt2cmd stmt = CmdAssert . stmt2expr $ stmt
+-- | Translates each of the statements in the list of block items to
+-- expressions.
+translateBlockItems :: [CBlockItem] -> [Expr]
+translateBlockItems = fmap translateStmt . catMaybes . fmap onlyStmts
+  where onlyStmts i = case i of CBlockStmt s -> Just s; _ -> Nothing
 
-stmt2expr :: CStat -> Expr
-stmt2expr (CCompound _ block_items _) = eAnd $ block2exprs block_items
-stmt2expr (CExpr (Just e) _) = expr2expr e
-stmt2expr (CIf condExpr thenStmt (Just elseStmt) _) =
+-- | Translates a C Statement AST to an SMTLib expression.
+translateStmt :: CStat -> Expr
+translateStmt (CCompound _ block_items _) = eAnd $ translateBlockItems block_items
+translateStmt (CExpr (Just e) _) = translateExpr e
+translateStmt (CIf condExpr thenStmt (Just elseStmt) _) =
   eOr [eAnd [condExpr', thenExpr], eAnd [eNot condExpr', elseExpr]]
   where
-    condExpr' = expr2expr condExpr
-    thenExpr = stmt2expr thenStmt
-    elseExpr = stmt2expr elseStmt
--- TODO: remove this because it should never happen after simplification.
-stmt2expr (CIf condExpr thenStmt Nothing _) =
-  eOr [eAnd [condExpr', thenExpr]]
-  where
-    condExpr' = expr2expr condExpr
-    thenExpr = stmt2expr thenStmt
-stmt2expr (CExpr Nothing _) = undefined
-stmt2expr s = error $ "Unsupported statement passed to translator: " ++ show s
+    condExpr' = translateExpr condExpr
+    thenExpr = translateStmt thenStmt
+    elseExpr = translateStmt elseStmt
+translateStmt (CExpr Nothing _) = undefined
+translateStmt s = transError "Unsupported statement passed to translator:" s
 
--- Convert ints into float
-expr2expr :: CExpr -> Expr
-expr2expr (CAssign _ left right _) =
-  App (I (N "fp.eq") []) Nothing [expr2expr left, expr2expr right]
-expr2expr (CBinary op left right _) =
-  App (I (N fpOp) []) Nothing [expr2expr left, expr2expr right]
+-- | Translates a C expression to an SMTLib expression
+translateExpr :: CExpr -> Expr
+translateExpr (CAssign _ left right _) =
+  App (I (N "fp.eq") []) Nothing [translateExpr left, translateExpr right]
+translateExpr (CBinary op left right _) =
+  App (I (N fpOp) []) Nothing [translateExpr left, translateExpr right]
   where
     fpOp =
       case op of
@@ -120,13 +87,65 @@ expr2expr (CBinary op left right _) =
         COrOp -> "fp.or"
         CLndOp -> "fp.and"
         CLorOp -> "fp.or"
-expr2expr (CVar ident _) = eName . identToString $ ident
-expr2expr (CConst (CFloatConst (CFloat sf) _)) = fp2bv . read $  sf
-expr2expr (CConst (CIntConst (CInteger n _ _) _)) = fp2bv . fromIntegral $ n
+translateExpr (CVar ident _) = eName . identToString $ ident
+translateExpr (CConst (CFloatConst (CFloat sf) _)) = fp2bv . read $  sf
+translateExpr (CConst (CIntConst (CInteger n _ _) _)) = fp2bv . fromIntegral $ n
 -- TODO: we're gonna probably want to support this stuff
--- expr2expr (CIndex (CExpression a) (CExpression a) _) = undefined
--- expr2expr (CCall (CExpression a) [CExpression a] _) = undefined
--- expr2expr (CMember (CExpression a) Ident Bool _) = undefined
--- expr2expr (CStatExpr (CStatement a) _) = undefined
--- expr2expr (CUnary CUnaryOp (CExpression a) _) = undefined
-expr2expr e = error $ "Unsupported expression passed to translator: " ++ show e
+-- translateExpr (CIndex (CExpression a) (CExpression a) _) = undefined
+-- translateExpr (CCall (CExpression a) [CExpression a] _) = undefined
+-- translateExpr (CMember (CExpression a) Ident Bool _) = undefined
+-- translateExpr (CStatExpr (CStatement a) _) = undefined
+-- translateExpr (CUnary CUnaryOp (CExpression a) _) = undefined
+translateExpr e = transError "Unsupported expression passed to translator: " e
+
+-- * Translation Helper Functions
+
+-- | SMTLib ident for FloatingPoint declarations
+floatingPoint :: SMTLib2.Ident
+floatingPoint = I (N "FloatingPoint") [8, 24]
+
+-- TODO: make sure this is right in terms of endianness, etc
+-- | Translates some Haskell float to the SMTLib floating point spec.
+fp2bv :: Float -> Expr
+fp2bv f = App (I (N "fp") []) Nothing [Lit nanbit', Lit top', Lit bottom']
+  where
+    (nanbit, top, bottom) = splitFP f
+    (nanbit', top', bottom') = (LitBV nanbit 1, LitBV top 8, LitBV bottom 23)
+    --
+    splitFP :: Float -> (Integer, Integer, Integer)
+    splitFP f_ = (nanbit_, integerize top_ 0, integerize bottom_ 0)
+      where
+        bits = map (\b -> if testBit (floatToWord f_) b then 1 else 0) [0..32]
+        (nanbit_, top_, bottom_) = (bits !! 8, take 8 bits, drop 9 bits)
+        integerize bs n = foldl (\num b-> shiftL (b .|. num) 1) n bs
+
+-- | Declare some floating point value.
+floatDecl :: String -> Command
+floatDecl name = CmdDeclareFun (N name) [] (TApp floatingPoint [])
+
+-- | 'ands' the list of expressions.
+eAnd :: [Expr] -> Expr
+eAnd [] = eEmpty
+eAnd es = App (I (N "and") []) Nothing es
+
+-- | 'ors' the list of expressions.
+eOr :: [Expr] -> Expr
+eOr [] = eEmpty
+eOr es = App (I (N "or") []) Nothing es
+
+-- | 'nots' the expression.
+eNot :: Expr -> Expr
+eNot e = App (I (N "not") [] ) Nothing [e]
+
+-- | Returns this string as the name
+eName :: String -> Expr
+eName name = App (I (N name) []) Nothing []
+
+-- | Blank expressions
+eEmpty :: Expr
+eEmpty = App (I (N "") []) Nothing []
+
+-- | Errors out, printing the pretty and raw value of the AST that
+-- caused the error.
+transError :: (Show a, Pretty a) => String -> a -> t
+transError m c = error $ m ++ "\nC value:\n" ++ show (pretty c) ++ "\nAST value:" ++ show c
