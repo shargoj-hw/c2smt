@@ -302,32 +302,19 @@ seperateFnCalls s = return s
 
 type Env = Map Ident Ident
 
-type UNState a = State (Integer, Env) a
-
+-- TODO: deal with stuff like "true"!
 -- | Gensyms new names for each variable in the program.
-uniqueNameify :: Data a => a -> UNState a
-uniqueNameify = everywhereM' uniqueNameify'
-  where
-    uniqueNameify' :: forall a. Typeable a => a -> UNState a
-    uniqueNameify' a
-      | typesMatch a (undefined :: CExpression NodeInfo) =
-        unsafeCoerce $ uniqueNamesE (unsafeCoerce a)
-      | typesMatch a (undefined :: CDeclarator NodeInfo) =
-          unsafeCoerce $ uniqueNamesD (unsafeCoerce a)
-      | otherwise = return a
-    uniqueNamesD :: CDeclr -> UNState CDeclr
-    uniqueNamesD (CDeclr (Just ident) dclr lit attrs ni) = do
-      (i, idMap) <- get
-      let newId = gensym i ident
-      put (i + 1, insert ident newId idMap)
-      return $ CDeclr (Just newId) dclr lit attrs ni
-    --
-    uniqueNamesE :: CExpr -> UNState CExpr
-    uniqueNamesE (CVar ident ni) = do
-      (_, idMap) <- get
-      let ident' = fromMaybe ident (Data.Map.lookup ident idMap)
-      return $ CVar ident' ni
-    uniqueNamesE e = return e
+uniqueNameify :: Data a => a -> TransformerM a
+uniqueNameify a = do
+  i <- get
+  modify (+1)
+  let rename (CVar ident _) = CVar (internalIdent $
+                                    "un" ++
+                                    show i ++
+                                    "_" ++
+                                    (identToString ident)) un
+      rename e = e
+  return $ everywhere (mkT rename) a
 
 -- | Creates a new variable name.
 gensym :: Show a => a -> Ident -> Ident
@@ -345,10 +332,7 @@ inlineFunCalls funDef defs = everywhereM (mkM inline) funDef
       let name = identToString ident
           -- This will have to change when we support stuff like sqrt
           Just fn = find (\f -> identToString (fnId f) == name) defs
-      i  <- get
-      let (fn', (i', _)) = runState (uniqueNameify fn) (i, empty)
-      put i'
-      return fn'
+      uniqueNameify fn
     --
     inline :: CStat -> TransformerM CStat
     inline (CCompound ids stmts _) = do
@@ -410,34 +394,42 @@ inlineFunctions tu = do
       fn' <- inlineFunCalls fn fns
       return $ fn':fns
 
-type SSAM = State (Integer, Env)
+type SSAM = State (Integer, Env, [Ident])
 
 ssa :: CFunDef -> TransformerM CFunDef
 ssa (CFunDef ds d drs s _) = do
   i <- get
-  let (s', (i', _)) = runState (ssaStmt s) (i, initialMap)
+  let (s', (i', _, ids)) = runState (ssaStmt s) (i, initialMap, [])
+      -- TODO: When you add ints, this needs to keep track of the types.
+      declrs = fmap (\ident -> CBlockDecl
+                               $ CDecl [CTypeSpec $ CFloatType un]
+                               [(Just $ CDeclr (Just ident) [] Nothing [] un,
+                                 Nothing, Nothing)] un
+                    ) ids
   put i'
-  return $ CFunDef ds d drs s' un
+  return $ CFunDef ds d drs (compoundWith s' (declrs ++)) un
   where
     initialMap =
       let ids = catMaybes $ listify (\ (_:: Maybe Ident) -> True) drs
       in foldr (\ i m -> insert i i m) empty ids
     --
-    setId idFrom idTo = modify $ second (insert idFrom idTo)
+    addIdInit ident = modify $ \ (i,e,l) -> (i, insert ident ident e, l)
     --
-    inc = modify $ first (+1)
+    addId idFrom idTo = modify $ \ (i,e,l) -> (i, insert idFrom idTo e, idTo:l)
+    --
+    inc = modify $ \ (i,e,l) -> (i+1, e, l)
     --
     newIdent ident = do
-      (i, m) <- get
+      (i, m, e) <- get
       let ident' = internalIdent $ (identToString ident) ++ "__" ++ show i
-      setId ident ident'
+      addId ident ident'
       inc
       return ident'
     --
     ssaBlocks :: CBlockItem -> SSAM CBlockItem
     ssaBlocks bd@(CBlockDecl decl) = do
       let did = declId decl
-      setId did did
+      addIdInit did
       return bd
     ssaBlocks bs@(CBlockStmt s) = do s' <- ssaStmt s; return $ CBlockStmt s'
     --
@@ -473,7 +465,7 @@ ssa (CFunDef ds d drs s _) = do
       ident' <- newIdent ident
       return $ CAssign op (CVar ident' un) r' un
     ssaExpr (CVar ident _) = do
-      (_, m) <- get
+      (_, m, l) <- get
       let ident' = fromMaybe ident (Data.Map.lookup ident m)
       return $ CVar ident' un
     ssaExpr e = return e
