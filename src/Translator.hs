@@ -120,8 +120,8 @@ fp2bv f = App (I (N "fp") []) Nothing [Lit nanbit', Lit top', Lit bottom']
     splitFP :: Float -> (Integer, Integer, Integer)
     splitFP f_ = (nanbit_, integerize top_ 0, integerize bottom_ 0)
       where
-        bits = map (\b -> if testBit (floatToWord f_) b then 1 else 0) [0..32]
-        (nanbit_, top_, bottom_) = (bits !! 8, take 8 bits, drop 9 bits)
+        bits = reverse $ map (\b -> if testBit (floatToWord f_) b then 1 else 0) [0..32]
+        (nanbit_, top_, bottom_) = (head bits, take 8 (drop 1 bits), drop 9 bits)
         integerize bs n = foldl (\num b-> shiftL (b .|. num) 1) n bs
 
 -- | Declare some floating point value.
