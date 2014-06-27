@@ -92,7 +92,7 @@ unrollLoops tu =
                                       CBlockStmt
                                       $ unrollWhile expr stmt (n - 1)]  un
         unrollLoops' (CFor init until update stmt _) =
-          CCompound [] [initItem, CBlockStmt $ unrollFor cond update stmt n] un
+          CCompound [] [initItem, CBlockStmt $ unrollFor cond update stmt (n - 1)] un
           where
             initItem =
               case init of
