@@ -59,6 +59,11 @@ translateStmt (CIf condExpr thenStmt (Just elseStmt) _) =
     condExpr' = translateExpr condExpr
     thenExpr = translateStmt thenStmt
     elseExpr = translateStmt elseStmt
+translateStmt (CIf condExpr thenStmt Nothing _) =
+  eOr [eAnd [condExpr', thenExpr]]
+  where
+    condExpr' = translateExpr condExpr
+    thenExpr = translateStmt thenStmt
 translateStmt (CExpr Nothing _) = undefined
 translateStmt s = transError "Unsupported statement passed to translator:" s
 

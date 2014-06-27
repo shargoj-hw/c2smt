@@ -11,6 +11,7 @@
 module AstTransformers where
 
 import           Control.Applicative  ((<$>))
+import           Control.Arrow        (first, second)
 import           Control.Monad.Reader
 import           Control.Monad.State
 import           Data.Data
@@ -19,7 +20,8 @@ import           Data.Generics        hiding (empty)
 import           Data.Graph
 import           Data.List            (find, nub)
 import           Data.Map             hiding (foldl, foldr)
-import           Data.Maybe           (fromJust, fromMaybe, maybeToList)
+import           Data.Maybe           (catMaybes, fromJust, fromMaybe,
+                                       maybeToList)
 import           Debug.Trace
 import           Language.C
 import           Unsafe.Coerce
@@ -29,7 +31,6 @@ import           Utils
 
 -- For playing in the REPL
 import           CExamples
-
 
 -- | Encapsulates all of the mutable state required by 'TransformerM'
 type TransformerState = Integer
@@ -56,11 +57,11 @@ transformerSteps =
   [
     (unrollLoops, "unrollLoops"),
     (simplifyControlFlow, "simplifyControlFlow"),
+    (ssaAll, "ssaAll"),
     (singleReturnify, "singleReturnify"),
     (removeAssnOps, "removeAssnOps"),
     (splitDeclsAndAssn, "splitDeclsAndAssn"),
-    (linearize, "linearize"),
-    (ssaAll, "ssaAll"),
+    (inlineFunctions, "inlineFunctions"),
     (moveDeclsToTop, "moveDeclsToTop")
   ]
 
@@ -269,7 +270,7 @@ fundefsOrderedByCalls tu = calls
 -- call in the expression and replacing the calls with them.
 --
 -- NOTE: The new declarations are of the form float foo_call_3 =
--- foo(4). This form is required by linearize.
+-- foo(4). This form is required by inlineFunctionCalls.
 seperateFnCalls :: CStat -> TransformerM CStat
 seperateFnCalls (CCompound ids stmts _) = do
   newcalls <- mapM seperateFnCallsBlockM stmts
@@ -324,7 +325,8 @@ uniqueNameify = everywhereM' uniqueNameify'
     uniqueNamesE :: CExpr -> UNState CExpr
     uniqueNamesE (CVar ident ni) = do
       (_, idMap) <- get
-      return $ CVar (idMap ! ident) ni
+      let ident' = fromMaybe ident (Data.Map.lookup ident idMap)
+      return $ CVar ident' ni
     uniqueNamesE e = return e
 
 -- | Creates a new variable name.
@@ -335,8 +337,8 @@ gensym i n =
 
 -- | Replaces all calls (after seperateFnCalls has been run on the
 -- data) with the functions found in defs.
-linearizeFunCalls :: Data a => a -> [CFunDef] -> TransformerM a
-linearizeFunCalls funDef defs = everywhereM (mkM linearize) funDef
+inlineFunCalls :: Data a => a -> [CFunDef] -> TransformerM a
+inlineFunCalls funDef defs = everywhereM (mkM inline) funDef
   where
     idToFunDef :: Ident -> TransformerM CFunDef
     idToFunDef ident = do
@@ -348,16 +350,16 @@ linearizeFunCalls funDef defs = everywhereM (mkM linearize) funDef
       put i'
       return fn'
     --
-    linearize :: CStat -> TransformerM CStat
-    linearize (CCompound ids stmts _) = do
-      stmts' <- mapM linearizeStmt stmts
+    inline :: CStat -> TransformerM CStat
+    inline (CCompound ids stmts _) = do
+      stmts' <- mapM inlineStmt stmts
       return $ CCompound ids (concat stmts') un
-    linearize s = return s
+    inline s = return s
     --
-    linearizeStmt :: CBlockItem -> TransformerM [CBlockItem]
-    linearizeStmt cb@(CBlockDecl d@(CDecl _ decls _))
-      | linearizble decls = do
-        let linearizeDecl (Just declr, Just (CInitExpr expr _), _) = do
+    inlineStmt :: CBlockItem -> TransformerM [CBlockItem]
+    inlineStmt cb@(CBlockDecl d@(CDecl _ decls _))
+      | inlinable decls = do
+        let inlineDecl (Just declr, Just (CInitExpr expr _), _) = do
               let CCall (CVar ident _) params _ = expr
               CFunDef fdeclspecs fdecl _ body _ <- idToFunDef ident
               let argdecls = listify (\ (_ :: CDecl) -> True) fdecl
@@ -368,12 +370,12 @@ linearizeFunCalls funDef defs = everywhereM (mkM linearize) funDef
                 ++ fmap CBlockDecl argdecls
                 ++ argItems
                 ++ [CBlockStmt (replaceReturn (declId d) body)]
-        bis <- mapM linearizeDecl decls
+        bis <- mapM inlineDecl decls
         return $ concat bis
       | otherwise = return [cb]
-    linearizeStmt i = return [i]
+    inlineStmt i = return [i]
     --
-    linearizble = all (\case {(Just _, Just _, _) -> True; _ -> False})
+    inlinable = all (\case {(Just _, Just _, _) -> True; _ -> False})
     --
     paramItems decls params = fmap doParamItem (zip decls params)
       where
@@ -392,90 +394,93 @@ linearizeFunCalls funDef defs = everywhereM (mkM linearize) funDef
         replace x = x
 
 -- | Linearizes all function calls.
-linearize :: CTranslUnit -> TransformerM CTranslUnit
-linearize tu = do tu' <- splitDeclsAndAssn tu
-                  tu'' <- everywhereM (mkM seperateFnCalls) tu'
-                  let fundefs = fundefsOrderedByCalls tu''
-                  fundefs' <- foldlM linearizeIt [] fundefs
-                  -- This is lazy on my part and removes global
-                  -- variables. When those go in, this has to change.
-                  return $
-                    CTranslUnit (reverse $ fmap CFDefExt fundefs') un
+inlineFunctions :: CTranslUnit -> TransformerM CTranslUnit
+inlineFunctions tu = do
+  tu' <- splitDeclsAndAssn tu
+  tu'' <- everywhereM (mkM seperateFnCalls) tu'
+  let fundefs = fundefsOrderedByCalls tu''
+  fundefs' <- foldlM linearizeIt [] fundefs
+  -- This is lazy on my part and removes global
+  -- variables. When those go in, this has to change.
+  return $
+    CTranslUnit (reverse $ fmap CFDefExt fundefs') un
   where
     linearizeIt :: [CFunDef] -> CFunDef -> TransformerM [CFunDef]
     linearizeIt fns fn = do
-      fn' <- linearizeFunCalls fn fns
+      fn' <- inlineFunCalls fn fns
       return $ fn':fns
 
-type SSAState a = State (Integer, Env, [Ident]) a
+type SSAM = State (Integer, Env)
 
--- | Performs Single Static Assignment across the program. Expects the
--- program to have been linearized.
 ssa :: CFunDef -> TransformerM CFunDef
-ssa fd = do
+ssa (CFunDef ds d drs s _) = do
   i <- get
-  let CFunDef dss d ds (CCompound ids stmts _) _ = fd
-      (stmts', (i', _, newIdents)) =
-        runState (everywhereM doSSA stmts) (i, empty, [])
-      decls = fmap floatDecl newIdents
+  let (s', (i', _)) = runState (ssaStmt s) (i, initialMap)
   put i'
-  return $ CFunDef dss d ds (CCompound ids (decls++stmts') un) un
+  return $ CFunDef ds d drs s' un
   where
-    doSSA :: forall a. Typeable a => a -> SSAState a
-    doSSA a
-      | typesMatch a (undefined :: CExpression NodeInfo) =
-        unsafeCoerce $ ssaE (unsafeCoerce a)
-      | typesMatch a (undefined :: CDeclarator NodeInfo) =
-          unsafeCoerce $ ssaD (unsafeCoerce a)
-      | otherwise = return a
+    initialMap =
+      let ids = catMaybes $ listify (\ (_:: Maybe Ident) -> True) drs
+      in foldr (\ i m -> insert i i m) empty ids
     --
-    ssaD :: CDeclr -> SSAState CDeclr
-    ssaD cd@(CDeclr (Just ident) _ _ _ _) = do
-      (i, idMap, newIdents) <- get
-      put (i, insert ident ident idMap, newIdents)
-      return cd
+    setId idFrom idTo = modify $ second (insert idFrom idTo)
     --
-    ssaE :: CExpr -> SSAState CExpr
-    ssaE (CVar ident ni) = do
-      (_, idMap, _) <- get
-      return $ CVar (mapGet ident idMap) ni
-    ssaE (CAssign op (CVar ident ni) rhs _) = do
-      (i, _, _) <- get
-      let ident' = gensym i ident
-      tempVarsInRhs <- temp ident
-      tempNewVar <- temp ident
-      let rep c@(CVar identRep _) =
-            if identRep == ident
-            then CVar tempVarsInRhs un
-            else c
-          rep e = e
-      modify (\(i, m, l) ->
-               (i+1,
-                insert ident ident'
-                (insert tempVarsInRhs ident
-                 (insert tempNewVar ident' m)),
-                ident':l))
-      return (CAssign op (CVar tempNewVar ni) (everywhere (mkT rep) rhs) un)
-    ssaE e = return e
+    inc = modify $ first (+1)
     --
-    temp n = do
-      (i, m, l) <- get
-      let nameStr = identToString n
-      put (i+1, m, l)
-      return $ internalIdent $ "TEMP_" ++ nameStr ++ "_" ++  show i
-
+    newIdent ident = do
+      (i, m) <- get
+      let ident' = internalIdent $ (identToString ident) ++ "__" ++ show i
+      setId ident ident'
+      inc
+      return ident'
     --
-    mapGet k map = if member k map then map ! k else k
+    ssaBlocks :: CBlockItem -> SSAM CBlockItem
+    ssaBlocks bd@(CBlockDecl decl) = do
+      let did = declId decl
+      setId did did
+      return bd
+    ssaBlocks bs@(CBlockStmt s) = do s' <- ssaStmt s; return $ CBlockStmt s'
     --
-    floatDecl ident = CBlockDecl $ CDecl [CTypeSpec (CFloatType un)]
-                      [(Just $ CDeclr (Just ident) [] Nothing [] un,
-                        Nothing,
-                        Nothing)]
-                      un
+    ssaStmt :: CStat -> SSAM CStat
+    ssaStmt (CIf cond thn (Just els) _) = do
+      cond' <- ssaExpr cond
+      initialState <- get
+      thn' <- ssaStmt thn
+      put initialState
+      els' <- ssaStmt els
+      return (CIf cond' thn' (Just els') un)
+    ssaStmt (CIf cond thn Nothing _) = do
+      cond' <- ssaExpr cond
+      initialState <- get
+      thn' <- ssaStmt thn
+      put initialState
+      return (CIf cond' thn' Nothing un)
+    ssaStmt (CCompound ids stmts _) = do
+      stmts' <- mapM ssaBlocks stmts
+      return $ CCompound ids stmts' un
+    ssaStmt (CExpr (Just e) _) = do
+      e' <- ssaExpr e
+      return $ CExpr (Just e') un
+    ssaStmt (CReturn (Just e) _) = do
+      e' <- ssaExpr e
+      return $ CReturn (Just e') un
+    ssaStmt s = return s
+    --
+    ssaExpr :: CExpr -> SSAM CExpr
+    ssaExpr (CAssign op (CVar ident _) r _) = do
+      -- This is a littttttle clunky, but it gets the job done!
+      r' <- everywhereM (mkM ssaExpr) r
+      ident' <- newIdent ident
+      return $ CAssign op (CVar ident' un) r' un
+    ssaExpr (CVar ident _) = do
+      (_, m) <- get
+      let ident' = fromMaybe ident (Data.Map.lookup ident m)
+      return $ CVar ident' un
+    ssaExpr e = return e
 
 -- | Performs SSA everywhere.
 ssaAll :: CTranslUnit -> TransformerM CTranslUnit
-ssaAll = everywhereM (mkM ssa)
+ssaAll = everywhereM' (mkM ssa)
 
 -- | Saves on typing.
 un :: NodeInfo

@@ -11,8 +11,6 @@ import           Utils
 -- For repl stuff
 import           CExamples
 
--- TODO: sample evocations
-
 main :: IO ()
 main = do
   config <- cmdArgs defaultConfig
